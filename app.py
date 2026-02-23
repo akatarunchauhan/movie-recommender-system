@@ -1,61 +1,160 @@
 import streamlit as st
 import pandas as pd
-import pickle
+import numpy as np
+import ast
 import requests
+import time
 
-# Load data
-movies = pd.DataFrame(pickle.load(open("movies_list.pkl", "rb")))
-similarity = pickle.load(open("similarity.pkl", "rb"))
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from nltk.stem.porter import PorterStemmer
+
+# ==============================
+# Helper Functions
+# ==============================
+
+ps = PorterStemmer()
+
+def stem(text):
+    return " ".join([ps.stem(word) for word in text.split()])
 
 
+def convert(text):
+    L = []
+    for i in ast.literal_eval(text):
+        L.append(i['name'])
+    return L
+
+
+def convert_cast(text):
+    L = []
+    counter = 0
+    for i in ast.literal_eval(text):
+        if counter != 3:
+            L.append(i['name'])
+            counter += 1
+        else:
+            break
+    return L
+
+
+def fetch_director(text):
+    L = []
+    for i in ast.literal_eval(text):
+        if i['job'] == 'Director':
+            L.append(i['name'])
+            break
+    return L
+
+
+# ==============================
+# Load & Process Data (Cached)
+# ==============================
 
 @st.cache_data
-def fetch_posters(movie_id):
-    url = f"https://api.themoviedb.org/3/movie/{movie_id}?api_key=9ffc3d5dc1fd7040afe47352ffa2d405&language=en-US"
+def load_and_process():
+    movies = pd.read_csv("tmdb_5000_movies.csv")
+    credits = pd.read_csv("tmdb_5000_credits.csv")
 
-    try:
-        response = requests.get(url, timeout=5)
-        response.raise_for_status()
-        data = response.json()
-        poster_path = data.get("poster_path")
+    movies = movies.merge(credits, on='title')
 
-        if poster_path:
-            return "https://image.tmdb.org/t/p/w500/" + poster_path
-        return "https://via.placeholder.com/500x750?text=No+Poster+Found"
+    movies = movies[['movie_id','title','overview','genres','keywords','cast','crew']]
+    movies.dropna(inplace=True)
 
-    except (requests.exceptions.RequestException, Exception) as e:
-        # This catches timeouts, connection errors, etc.
-        st.warning(f"Could not fetch poster for ID {movie_id}. Using placeholder.")
-        return "https://via.placeholder.com/500x750?text=Connection+Error"
+    movies['genres'] = movies['genres'].apply(convert)
+    movies['keywords'] = movies['keywords'].apply(convert)
+    movies['cast'] = movies['cast'].apply(convert_cast)
+    movies['crew'] = movies['crew'].apply(fetch_director)
 
+    movies['overview'] = movies['overview'].apply(lambda x: x.split())
+
+    # Remove spaces inside names
+    movies['genres'] = movies['genres'].apply(lambda x: [i.replace(" ","") for i in x])
+    movies['keywords'] = movies['keywords'].apply(lambda x: [i.replace(" ","") for i in x])
+    movies['cast'] = movies['cast'].apply(lambda x: [i.replace(" ","") for i in x])
+    movies['crew'] = movies['crew'].apply(lambda x: [i.replace(" ","") for i in x])
+
+    movies['tags'] = movies['overview'] + movies['genres'] + movies['keywords'] + movies['cast'] + movies['crew']
+
+    new = movies[['movie_id','title','tags']]
+    new['tags'] = new['tags'].apply(lambda x: " ".join(x))
+    new['tags'] = new['tags'].apply(lambda x: x.lower())
+    new['tags'] = new['tags'].apply(stem)
+
+    cv = CountVectorizer(max_features=5000, stop_words='english')
+    vectors = cv.fit_transform(new['tags']).toarray()
+
+    similarity = cosine_similarity(vectors)
+
+    return new, similarity
+
+
+movies, similarity = load_and_process()
+
+@st.cache_data
+
+def fetch_poster(movie_id):
+    api_key = st.secrets["API_KEY"]
+
+    url = f"https://api.themoviedb.org/3/movie/{movie_id}?api_key={api_key}&language=en-US"
+
+    response = requests.get(url)
+    data = response.json()
+
+
+    poster_path = data.get("poster_path")
+
+    if poster_path:
+        return "https://image.tmdb.org/t/p/w500/" + poster_path
+    else:
+        return None
 
 def recommend(movie):
     movie_index = movies[movies['title'] == movie].index[0]
     distances = similarity[movie_index]
-    movies_list = sorted(list(enumerate(distances)), reverse=True, key=lambda x: x[1])
 
-    recommended_movie_names = []
-    recommended_movie_posters = []
+    movie_list = sorted(
+        list(enumerate(distances)),
+        reverse=True,
+        key=lambda x: x[1]
+    )[1:6]
 
-    for i in movies_list[1:6]:
-        # Get movie_id and title
+    recommended_movies = []
+    recommended_posters = []
+
+    for i in movie_list:
         movie_id = movies.iloc[i[0]].movie_id
-        recommended_movie_names.append(movies.iloc[i[0]].title)
-        # Fetch poster
-        recommended_movie_posters.append(fetch_posters(movie_id))
+        recommended_movies.append(movies.iloc[i[0]].title)
+        recommended_posters.append(fetch_poster(movie_id))
 
-    return recommended_movie_names, recommended_movie_posters
+    return recommended_movies, recommended_posters
 
 
-st.title("Movies Recommender System")
-selected_movie_name = st.selectbox("Enter a movie name...", movies['title'].values)
+st.markdown("<h1>MOVIE RECOMMENDER</h1>", unsafe_allow_html=True)
+st.markdown("<br>", unsafe_allow_html=True)
+
+st.markdown("### 🎥 Choose a Movie", unsafe_allow_html=True)
+
+selected_movie = st.selectbox(
+    "",
+    movies['title'].values
+)
+
+st.markdown("<br>", unsafe_allow_html=True)
 
 if st.button("Show Recommendations"):
-    with st.spinner('Fetching recommendations...'):
-        names, posters = recommend(selected_movie_name)
+    names, posters = recommend(selected_movie)
 
-        cols = st.columns(5)
-        for i in range(5):
-            with cols[i]:
-                st.text(names[i])
-                st.image(posters[i])
+    st.markdown("## 🔥 Top Picks For You")
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    cols = st.columns(5)
+
+    for i in range(5):
+        with cols[i]:
+            if posters[i]:
+                st.image(posters[i], use_container_width=True)
+            st.markdown(
+                f"<div class='movie-title'>{names[i]}</div>",
+                unsafe_allow_html=True
+            )
